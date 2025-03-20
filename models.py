@@ -45,21 +45,24 @@ class MMGN(nn.Module):
     def __init__(self, x_dim, v_dim, hidden_dim, num_layers, activation, scaling_function):
         super(MMGN, self).__init__()
         self.a = nn.Parameter(torch.zeros(x_dim))
-        self.V = nn.Linear(v_dim, x_dim, bias=False)
+        self.V = nn.Linear(x_dim, v_dim, bias=False)
         self.W_list = nn.ModuleList([nn.Linear(x_dim, hidden_dim, bias=False) for _ in range(num_layers)])      # W_k
         self.bias_list = nn.ParameterList([nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_layers)])   # b_k
         self.activation = activation                                                                            # \sigma_k
         self.scaling_function = scaling_function                                                                # s_k
 
     def forward(self, x):
-        term1 = self.V.weight.T @ self.V(x)  # V^T V x
+        # V^T V x
+        # print(x.shape)
+        term1 = einops.einsum(self.V(x), self.V.weight, 'batch v_dim, v_dim x_dim -> batch x_dim')
 
         # Sum term
         sum_term = 0
         for k in range(len(self.W_list)):
             z_k = self.W_list[k](x) + self.bias_list[k]  # z_k = W_k x + b_k
             scale = self.scaling_function(z_k)  # s(z_k)
-            weighted_activation = self.W_list[k].weight.T @ self.activation(z_k)  # W_k^T \sigma_k(z_k)
+            # W_k^T \sigma_k(z_k)
+            weighted_activation = einops.einsum(self.activation(z_k), self.W_list[k].weight, 'batch hidden, hidden x_dim -> batch x_dim')
             sum_term += scale * weighted_activation
 
         out = self.a + term1 + sum_term
@@ -228,11 +231,10 @@ class DualWassersteinDistance:
             x_score = self.critic(x).mean()
             y_score = self.critic(y).mean()
             
-            # Compute Wasserstein loss E[f(real)] - E[f(fake)] that we will maximize
-            wasserstein_loss = y_score - x_score
+            # Compute Wasserstein loss E[f(fake)] - E[f(real)] that we will minimize
+            wasserstein_loss = x_score - y_score
             
-            # Update critic by maximizing Wasserstein loss
-            (wasserstein_loss).backward()
+            wasserstein_loss.backward()
             self.optimizer.step()
             
             # Clip weights to enforce Lipschitz constraint
@@ -252,15 +254,9 @@ class DualWassersteinDistance:
         Returns:
             Scalar tensor containing the estimated Wasserstein distance
         """
-        with torch.no_grad():
-            x_score = self.critic(x).mean()
-            y_score = self.critic(y).mean()
-            
-            # Wasserstein distance estimate (consistent with training)
-            # Positive when real scores higher than fake (desired direction)
-            wasserstein_dist = y_score - x_score
-            
-        return wasserstein_dist
+        x_score = self.critic(x).mean()
+                    
+        return -x_score.mean()
     
 
 import torch
