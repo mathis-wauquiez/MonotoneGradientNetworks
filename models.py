@@ -72,13 +72,17 @@ class MMGN(nn.Module):
 class MLP(nn.Module):
     def __init__(self, x_dim, hidden_dim, num_layers, activation):
         super(MLP, self).__init__()
-        self.layers = nn.ModuleList([nn.Linear(x_dim, hidden_dim)] + [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)] + [nn.Linear(hidden_dim, x_dim)])
+        self.layers = nn.ModuleList([nn.Linear(x_dim, hidden_dim)])
+        for _ in range(num_layers - 1):
+            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+        self.layers.append(nn.Linear(hidden_dim, 1))  # Output a single value
         self.activation = activation
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
 
     def forward(self, x):
-        for layer in self.layers:
-            x = self.activation(layer(x))
-        return x
+        for i, layer in enumerate(self.layers[:-1]):
+            x = self.layer_norms[i](self.activation(layer(x)))
+        return self.layers[-1](x)  # No activation on the last layer
 
 
 
@@ -182,82 +186,71 @@ class MMDDistance:
         mmd = x_kernel.mean() + y_kernel.mean() - 2 * xy_kernel.mean()
         return mmd
 
+import torch
+
 class DualWassersteinDistance:
     def __init__(self, input_dim, hidden_dim=64, critic_lr=0.0005, 
-                 critic_iterations=5, clip_value=0.01):
-        """
-        Initialize the Adversarial Wasserstein Distance calculator.
-        
-        This implements a Wasserstein GAN-style critic approach to estimate
-        the Wasserstein distance between two distributions.
-        
-        Args:
-            input_dim: Dimensionality of the input data
-            hidden_dim: Size of hidden layers in the critic network
-            critic_lr: Learning rate for the critic
-            critic_iterations: Number of critic updates per distance calculation
-            clip_value: Value to clip weights for Wasserstein constraint
-        """
+                 critic_iterations=5, lambda_gp=10):
         self.input_dim = input_dim
         self.critic_iterations = critic_iterations
-        self.clip_value = clip_value
+        self.lambda_gp = lambda_gp
         
         # Initialize critic network
-        self.critic = MLP(input_dim, hidden_dim, num_layers=3, activation=nn.ReLU())
+        self.critic = MLP(input_dim, hidden_dim, num_layers=3, activation=nn.LeakyReLU(0.2))
         
         # Initialize optimizer
-        self.optimizer = optim.RMSprop(self.critic.parameters(), lr=critic_lr)
+        self.optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr, betas=(0.5, 0.9))
         
-    def update(self, x, y):
-        """
-        Update the critic network to better approximate Wasserstein distance.
+    def compute_gradient_penalty(self, real_samples, fake_samples):
+        # Random weight term for interpolation
+        alpha = torch.rand(real_samples.size(0), 1).to(real_samples.device)
         
-        Args:
-            x: Samples from the first distribution (fake)
-            y: Samples from the second distribution (real)
-        """
-        self.critic.train()
+        # Get random interpolation between real and fake samples
+        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+        
+        # Calculate critic scores of interpolated samples
+        d_interpolates = self.critic(interpolates)
+        
+        # Get gradients w.r.t. interpolates
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        
+        # Compute gradient penalty
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        return gradient_penalty
 
-        # Ensure inputs don't require gradients for critic training
-        x = x.detach()
-        y = y.detach()
+    def update(self, x, y):
+        self.critic.train()
         
-        # Train the critic multiple times
         for _ in range(self.critic_iterations):
-            # Zero gradients
             self.optimizer.zero_grad()
             
             # Compute critic scores
             x_score = self.critic(x).mean()
             y_score = self.critic(y).mean()
             
-            # Compute Wasserstein loss E[f(fake)] - E[f(real)] that we will minimize
-            wasserstein_loss = x_score - y_score
+            # Compute gradient penalty
+            gradient_penalty = self.compute_gradient_penalty(y, x)
             
-            wasserstein_loss.backward()
+            # Compute the Wasserstein distance with gradient penalty
+            wasserstein_distance = y_score - x_score
+            critic_loss = -wasserstein_distance + self.lambda_gp * gradient_penalty
+            
+            critic_loss.backward()
             self.optimizer.step()
-            
-            # Clip weights to enforce Lipschitz constraint
-            for param in self.critic.parameters():
-                param.data.clamp_(-self.clip_value, self.clip_value)
 
         self.critic.eval()
     
     def __call__(self, x, y):
-        """
-        Calculate the approximate Wasserstein distance between x and y.
-        
-        Args:
-            x: Samples from the first distribution (fake)
-            y: Samples from the second distribution (real)
-            
-        Returns:
-            Scalar tensor containing the estimated Wasserstein distance
-        """
         x_score = self.critic(x).mean()
-                    
-        return -x_score.mean()
-    
+        wasserstein_distance = -x_score
+        return wasserstein_distance
 
 import torch
 from torch.distributions import MultivariateNormal
@@ -290,19 +283,38 @@ class GMMSampler:
         ]
     
     def sample(self, n_samples):
-        """Sample n_samples from the GMM"""
+        """
+        Sample n_samples from the GMM more efficiently by batch sampling components
+        
+        This optimized version samples all points from each component in one batch
+        operation rather than iterating through each sample individually.
+        """
         # Choose components based on weights
         component_indices = torch.multinomial(
             self.weights, n_samples, replacement=True
         )
         
-        # Sample from the selected components
-        samples = torch.zeros(n_samples, len(self.means[0]))
-        for i, comp_idx in enumerate(component_indices):
-            samples[i] = self.distributions[comp_idx].sample()
+        # Count occurrences of each component
+        component_counts = torch.bincount(component_indices, minlength=self.n_components)
         
-        return samples
-    
+        # Initialize samples tensor
+        samples = torch.zeros(n_samples, len(self.means[0]))
+        
+        # Track the current position in the samples tensor
+        current_idx = 0
+        
+        # Sample from each component in batches
+        for comp_idx, count in enumerate(component_counts):
+            if count > 0:
+                # Generate all samples for this component at once
+                comp_samples = self.distributions[comp_idx].sample((count.item(),))
+                
+                # Place them in the samples tensor
+                samples[current_idx:current_idx + count] = comp_samples
+                current_idx += count
+        
+        return samples  
+          
     def log_likelihood(self, x):
         """
         Compute the log-likelihood of the data given the GMM parameters

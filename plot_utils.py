@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 
-def plot_kde_comparison(x_samples, y_samples, p_y=None, cmap_x='plasma', cmap_y='coolwarm', left_title=None):
+def plot_kde_comparison(x_samples, y_samples, p_y=None, cmap_x='plasma', cmap_y='coolwarm', left_title=None, alpha=0.15):
     """
     Plots KDE for x_samples and y_samples. If p_y is provided, it is used instead of KDE for y_samples.
     
@@ -32,7 +32,7 @@ def plot_kde_comparison(x_samples, y_samples, p_y=None, cmap_x='plasma', cmap_y=
         
         # Plot
         ax.contourf(xx, yy, zz, levels=30, cmap=cmap, alpha=0.8)
-        ax.scatter(x, y, s=5, color='black', alpha=0.3)
+        ax.scatter(x, y, s=5, color='black', alpha=alpha)
         ax.set_xlim([xmin, xmax])
         ax.set_ylim([ymin, ymax])
     
