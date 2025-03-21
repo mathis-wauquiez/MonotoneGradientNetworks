@@ -86,6 +86,166 @@ class MLP(nn.Module):
 
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ICNN(nn.Module):
+    """
+    Input Convex Neural Network (ICNN) that returns its gradient as output.
+    
+    This implementation is designed for optimal transport problems where
+    the gradient of a convex function represents the transport map.
+    When called, it returns the gradient (transport map) directly.
+    """
+    
+    def __init__(self, input_dim, hidden_dims, softplus_param=1.0):
+        """
+        Initialize an ICNN.
+        
+        Args:
+            input_dim: Dimension of the input
+            hidden_dims: List of hidden layer dimensions
+            softplus_param: Parameter for softplus activation (beta)
+        """
+        super(ICNN, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.softplus_param = softplus_param
+        
+        # Direct connections from input to hidden layers
+        self.direct_layers = nn.ModuleList()
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            self.direct_layers.append(nn.Linear(input_dim, hidden_dim, bias=True))
+            prev_dim = hidden_dim
+            
+        # Connections between hidden layers (with non-negative weights)
+        self.hidden_layers = nn.ModuleList()
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            self.hidden_layers.append(nn.Linear(prev_dim, hidden_dim, bias=True))
+            prev_dim = hidden_dim
+            
+        # Output layer
+        self.output_layer = nn.Linear(prev_dim, 1, bias=True)
+        
+        # Initialize with non-negative weights for hidden-to-hidden connections
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """Initialize weights ensuring non-negativity constraints are satisfied."""
+        for layer in self.hidden_layers:
+            # Initialize weights to small positive values
+            nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+            layer.weight.data.abs_()  # Make weights non-negative
+            
+    def convex_function(self, x):
+        """
+        Computes the convex function value (original ICNN forward pass).
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Convex function output
+        """
+        z = x
+        
+        for i in range(len(self.hidden_dims)):
+            # Direct connection from input
+            direct_out = self.direct_layers[i](x)
+            
+            # Connection from previous layer with non-negative weights
+            if i == 0:
+                hidden_out = self.hidden_layers[i](z)
+            else:
+                hidden_out = self.hidden_layers[i](z)
+                
+            # Combine direct and hidden connections
+            z = F.softplus(direct_out + hidden_out, beta=self.softplus_param)
+        
+        # Final output layer
+        output = self.output_layer(z)
+        
+        return output
+    
+    def forward(self, x):
+        """
+        Forward pass returns the gradient of the convex function with respect to input.
+        This gradient represents the optimal transport map.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Gradient of the convex function (transport map)
+        """
+        # Detach x from previous computations and enable grad
+        x_detached = x.detach().requires_grad_(True)
+        
+        # Compute convex function value
+        convex_output = self.convex_function(x_detached)
+        
+        # Compute gradient w.r.t input
+        gradient = torch.autograd.grad(
+            outputs=convex_output.sum(),
+            inputs=x_detached,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        
+        return gradient
+    
+    def get_function_value(self, x):
+        """
+        Get the actual function value (not the gradient).
+        Useful for debugging or additional computations.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Convex function output
+        """
+        return self.convex_function(x)
+    
+    def project_weights(self):
+        """Project weights to satisfy the non-negativity constraint."""
+        with torch.no_grad():
+            for layer in self.hidden_layers:
+                layer.weight.data.clamp_(0)  # Ensure weights remain non-negative
+                
+    def hessian(self, x):
+        """
+        Compute the Hessian of the convex function at point x.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Hessian matrix of the ICNN at point x
+        """
+        x_detached = x.detach().requires_grad_(True)
+        gradient = self.forward(x_detached)
+        
+        hessian_rows = []
+        for i in range(x.shape[1]):
+            hessian_rows.append(torch.autograd.grad(
+                gradient[:, i].sum(), x_detached, create_graph=True
+            )[0])
+            
+        hessian = torch.stack(hessian_rows, dim=2)
+        return hessian
+
+
+# Example for creating the ICNN
+def create_icnn_for_ot(input_dim, hidden_dims=[64, 64, 32]):
+    """Factory function to create an ICNN for optimal transport."""
+    return ICNN(input_dim, hidden_dims)
+
+
 ########################## DISTRIBUTION DISTANCE METRICS ##########################
 
 
