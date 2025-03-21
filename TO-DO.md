@@ -1,0 +1,3 @@
+- Comparer avec ICNN
+- Regarder si on peut pas obtenir une forme pour l'expression du gradient d'ICNN ?
+- Apprendre sur MNIST
